@@ -1392,6 +1392,27 @@ function updateShortcutPreference(mode, accelerator) {
  * @param mode 'single' | 'long' | 'quick'
  * @returns { success } 是否成功发起
  */
+/**
+ * 给 Promise 加超时。desktopCapturer.getSources 在 macOS 权限未决/未生效时
+ * 可能既不 resolve 也不 reject（挂起），必须有时间上限，否则截图流程会
+ * 永久卡住且界面上毫无反馈。
+ */
+function withTimeout(promise, ms, label) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(label)), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
+}
+
 async function startScreenCapture(mode = 'single') {
   // Guard against re-entrant triggers. `activeCaptureSession` is only set
   // *after* the long `await`s below (getSources + did-finish-load wait).
@@ -1399,6 +1420,16 @@ async function startScreenCapture(mode = 'single') {
   // pass the check below and call ensureOverlayWindowsForDisplays() ->
   // closeCaptureOverlay(), destroying the windows this invocation is still
   // using — which later throws "Object has been destroyed" at `.focus()`.
+  //
+  // 自愈：若上次会话异常中断（overlay 窗口已全部销毁但会话状态未清理），
+  // 先清掉僵尸会话再继续，避免「一次失败后按钮永远提示会话进行中」。
+  if (
+    hostState.activeCaptureSession &&
+    !overlayWindows.some((win) => !win.isDestroyed())
+  ) {
+    hostState.activeCaptureSession = null;
+  }
+
   if (captureStarting || hostState.activeCaptureSession || hostState.longCaptureSession) {
     hostState.captureErrorMessage = '当前已有截图会话进行中，请先完成或取消当前会话。';
     broadcastShellState();
@@ -1426,13 +1457,40 @@ async function startScreenCapture(mode = 'single') {
   // loadRenderer was fire-and-forget inside createOverlayWindow() so the
   // overlay windows are already loading in the background.  We resume
   // the capture pipeline immediately while loading proceeds in parallel.
-  const [sources] = await Promise.all([
-    desktopCapturer.getSources({
-      types: ['screen'],
-      thumbnailSize: { width: captureMaxSide, height: captureMaxSide },
-    }),
-    Promise.resolve(overlayWindows),
-  ]);
+  //
+  // 关键：desktopCapturer.getSources 在 macOS 上权限未决/未生效时可能抛错，
+  // 也可能挂起（既不 resolve 也不 reject）。绝不能让异常沿 IPC 静默传播到
+  // 渲染端——渲染端没有对应 catch，会表现为「点击截图按钮无任何反应」。
+  // 这里必须捕获一切错误并转换为用户可读的提示。
+  let sources;
+  try {
+    sources = await withTimeout(
+      desktopCapturer.getSources({
+        types: ['screen'],
+        thumbnailSize: { width: captureMaxSide, height: captureMaxSide },
+      }),
+      20000,
+      '读取屏幕内容超时（20 秒）',
+    );
+  } catch (err) {
+    refreshPermissionState();
+    const st = hostState.permissions.screenCapture;
+    console.error('[capture] getSources failed:', err?.message ?? err);
+    if (st === 'denied' || st === 'restricted') {
+      hostState.captureErrorMessage =
+        '屏幕录制权限已被拒绝或受限。请打开「系统设置 → 隐私与安全性 → 屏幕录制」允许本应用，然后完全退出并重新打开本应用（macOS 权限变更需重启后生效）。';
+    } else if (st === 'granted') {
+      // 权限显示已授予却仍失败：多为授权后未重启（TCC 对运行中进程不生效）。
+      hostState.captureErrorMessage =
+        `读取屏幕内容失败：${err?.message ?? String(err)}。若刚在系统设置中开启过权限，请完全退出（托盘图标右键退出）并重新打开本应用后再试。`;
+    } else {
+      hostState.captureErrorMessage =
+        '未能读取屏幕内容：尚未获得「屏幕录制」权限。请允许系统弹出的授权请求；若未弹出，请到「系统设置 → 隐私与安全性 → 屏幕录制」手动开启权限，然后完全退出并重新打开本应用再试。';
+    }
+    broadcastShellState();
+    closeCaptureOverlay();
+    return { success: false };
+  }
 
   if (!sources || sources.length === 0) {
     // 未读到屏幕内容：权限未授予 / 被拒绝 / 受限。读取运行进程内的真实状态给出指引。
@@ -1511,6 +1569,18 @@ async function startScreenCapture(mode = 'single') {
     }
   }
 
+  // 至少一个 overlay 窗口真正加载出了渲染页面，才认为框选界面可用；
+  // 否则会出现「窗口已显示但完全透明、挡住点击却看不到任何内容」的假死状态。
+  const loadedOverlays = overlayWindows.filter(
+    (win) => !win.isDestroyed() && win.webContents.getURL().includes('index.html'),
+  );
+  if (loadedOverlays.length === 0) {
+    hostState.captureErrorMessage = '截图框选界面加载失败，请重试；若持续失败请重新安装或更新应用。';
+    broadcastShellState();
+    closeCaptureOverlay();
+    return { success: false };
+  }
+
   hostState.activeCaptureSession = {
     mode,
     overlayBounds: displays.map((d) => ({ ...d.bounds })),
@@ -1543,6 +1613,15 @@ async function startScreenCapture(mode = 'single') {
     overlayWindows[0].focus();
   }
   return { success: true };
+  } catch (err) {
+    // 兜底：任何未预期异常都不能沿 IPC 静默抛给渲染端——渲染端表现为
+    // 「点击截图按钮无任何反应」。统一转换为用户可见的错误提示并清理现场。
+    console.error('[capture] startScreenCapture unexpected error:', err);
+    hostState.activeCaptureSession = null;
+    hostState.captureErrorMessage = `发起截图失败：${err?.message ?? String(err)}。请重试；若持续失败请完全退出并重新打开本应用。`;
+    broadcastShellState();
+    closeCaptureOverlay();
+    return { success: false };
   } finally {
     captureStarting = false;
   }

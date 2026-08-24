@@ -672,7 +672,13 @@ const DesktopShellView = () => {
       return;
     }
 
-    await window.desktopHost.startScreenCapture();
+    // 防御：若 IPC 意外拒绝（主进程异常未被兜底捕获），不能让异常静默吞掉——
+    // 那会表现为「点击无任何反应」。捕获后强制刷新状态，让面板显示最新错误。
+    try {
+      await window.desktopHost.startScreenCapture();
+    } catch (err) {
+      console.error('[panel] startScreenCapture IPC 调用失败:', err);
+    }
     await refresh();
   }
 
@@ -681,7 +687,11 @@ const DesktopShellView = () => {
       return;
     }
 
-    await window.desktopHost.startLongScreenCapture();
+    try {
+      await window.desktopHost.startLongScreenCapture();
+    } catch (err) {
+      console.error('[panel] startLongScreenCapture IPC 调用失败:', err);
+    }
     await refresh();
   }
 
@@ -690,7 +700,11 @@ const DesktopShellView = () => {
       return;
     }
 
-    await window.desktopHost.startQuickScreenCapture();
+    try {
+      await window.desktopHost.startQuickScreenCapture();
+    } catch (err) {
+      console.error('[panel] startQuickScreenCapture IPC 调用失败:', err);
+    }
     await refresh();
   }
 
