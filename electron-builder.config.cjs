@@ -1,6 +1,14 @@
 /**
  * electron-builder 配置文件（取代 package.json 中的 "build" 键）。
  *
+ * 打包策略：通用（Universal）打包。mac.target 的 arch 设为 ['universal']，
+ * electron-builder 会分别下载 x64 与 arm64 的 Electron 二进制，并用 lipo
+ * 合并为单一通用 Mach-O，产出一个同时兼容 Intel 与 Apple Silicon 的 .app，
+ * 最终由 build.sh 经 hdiutil 封装为单一 .dmg，任何 Mac 均可直接安装使用。
+ *
+ * 注意：不要在此固定 electronDist 为本地单架构 electron——通用打包要求
+ * electron-builder 自行拉取两套架构并合并，固定 electronDist 会破坏通用构建。
+ *
  * 签名与公证通过环境变量驱动，无需修改本文件：
  *   export CSC_NAME="Developer ID Application: Your Name (TEAMID)"
  *   export APPLE_API_KEY="/path/to/AuthKey_*.p8"
@@ -16,14 +24,7 @@
  *
  * @type {import('electron-builder').Configuration}
  */
-const path = require('path');
 const fs = require('fs');
-
-/** 用 require.resolve 动态定位 electron 的 dist 目录，兼容 pnpm symlink 结构 */
-const electronDist = path.join(
-  path.dirname(require.resolve('electron/package.json')),
-  'dist',
-);
 
 /**
  * 仅当 OCR 引擎二进制存在时才列为需要解包的资源。
@@ -44,7 +45,6 @@ const hasNotarizeCreds = identity && Boolean(
 module.exports = {
   appId: 'com.idl.ocr',
   productName: 'mac-OCR',
-  electronDist,
   copyright: 'Copyright © 2026',
   directories: {
     output: 'release',
@@ -70,7 +70,7 @@ module.exports = {
     target: [
       {
         target: 'dir',
-        arch: ['arm64'],
+        arch: ['universal'],
       },
     ],
     category: 'public.app-category.productivity',
@@ -88,5 +88,11 @@ module.exports = {
     // 仅用 API Key 时 teamId 可省略，electron-builder 会从 APPLE_API_ISSUER 推断。
     notarize: hasNotarizeCreds ? true : false,
     icon: 'public/img/icon.png',
+    // 预编译的 OCR 引擎为单文件原生二进制（electron/screen-ocr-engine.bin），
+    // 通用打包时会被原样打进 x64 / arm64 两个切片。编译阶段已尽量将其产出为
+    // 通用（fat）二进制，合并步骤会直接接受；若某环境回退为单架构，此处声明
+    // x64ArchFiles 让 @electron/universal 跳过该文件（异架构 Mac 经 Rosetta 运行
+    // OCR），避免合并因"两份相同的单架构二进制"而报错。
+    x64ArchFiles: '**/screen-ocr-engine.bin',
   },
 };

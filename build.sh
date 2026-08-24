@@ -227,14 +227,34 @@ compile_ocr_binary() {
     return 0
   fi
 
-  log "使用 swiftc 编译 OCR 引擎…"
-  # -O 优化；产物为 Mach-O 可执行文件，后续由 electron-builder 通过
-  # asarUnpack 解包到 app.asar.unpacked/electron/ 下供运行时直接执行。
-  if run swiftc -O "$ocr_src" -o "$ocr_bin"; then
+  log "使用 swiftc 交叉编译 x86_64 与 arm64 并 lipo 合并为通用（Universal）二进制…"
+  # 通用打包要求 OCR 引擎在两套架构切片中均为合法通用二进制；
+  # 若其为单架构且两份相同，electron-builder 的合并步骤会直接报错。
+  # 因此这里分别产出 x64 / arm64 两个 Mach-O，再用 lipo 合并为 fat 二进制，
+  # 这样无论打包目标是 universal / x64 / arm64 都能正确合并。
+  # 部署目标至少 macOS 13（源码用到 automaticallyDetectsLanguage，需 13.0+）。
+  local ocr_x64="$ROOT/electron/screen-ocr-engine.x64.bin"
+  local ocr_arm64="$ROOT/electron/screen-ocr-engine.arm64.bin"
+
+  if run swiftc -O -target x86_64-apple-macosx13.0 "$ocr_src" -o "$ocr_x64" \
+     && run swiftc -O -target arm64-apple-macosx13.0 "$ocr_src" -o "$ocr_arm64" \
+     && run lipo -create -output "$ocr_bin" "$ocr_x64" "$ocr_arm64"; then
+    rm -f "$ocr_x64" "$ocr_arm64" 2>/dev/null || true
     chmod +x "$ocr_bin" 2>/dev/null || true
-    log "OCR 引擎二进制已生成：${ocr_bin}"
+    log "OCR 引擎通用二进制已生成：${ocr_bin}"
+    log "$(lipo -info "$ocr_bin" 2>/dev/null || echo '（架构信息获取失败）')"
   else
-    warn "OCR 引擎编译失败，打包后的应用将缺少离线识别能力（开发态仍可回退 swift）。"
+    # 交叉编译/合并失败（极端环境）时回退为单架构编译；
+    # 配合配置中的 x64ArchFiles，合并步骤会跳过该文件（异架构 Mac 经 Rosetta 运行 OCR），
+    # 不阻断整体通用打包。
+    warn "OCR 通用二进制编译失败，回退为单架构编译（异架构 Mac 上将经 Rosetta 运行）。"
+    rm -f "$ocr_x64" "$ocr_arm64" 2>/dev/null || true
+    if run swiftc -O "$ocr_src" -o "$ocr_bin"; then
+      chmod +x "$ocr_bin" 2>/dev/null || true
+      log "OCR 引擎单架构二进制已生成：${ocr_bin}"
+    else
+      warn "OCR 引擎编译失败，打包后的应用将缺少离线识别能力（开发态仍可回退 swift）。"
+    fi
   fi
 }
 
@@ -266,11 +286,17 @@ build_app() {
   stage "阶段 3/4：electron-builder 打包 .app"
 
   # 清理旧的 mac 产物目录，避免残留导致定位到过期 .app。
-  rm -rf "$RELEASE_DIR/mac-arm64" "$RELEASE_DIR/mac" 2>/dev/null || true
+  # 通用（universal）打包的 --dir 产物位于 release/mac；
+  # 同时清理历史 arm64/x64/universal 目录，防止交叉架构残留。
+  rm -rf "$RELEASE_DIR/mac" "$RELEASE_DIR/mac-arm64" "$RELEASE_DIR/mac-x64" "$RELEASE_DIR/mac-universal" 2>/dev/null || true
 
   # --dir 仅产出解包后的 .app（沿用现有 pack 逻辑），dmg 交由 hdiutil 生成。
-  run "${ELECTRON_BUILDER}" --dir --config electron-builder.config.cjs \
-    || fail "electron-builder 打包中断。常见原因：依赖损坏、electronDist 缺失、磁盘空间不足。详见 ${LOG}。"
+  # 显式传入 --universal --mac 强制通用（Universal）打包：electron-builder 会
+  # 分别下载 x64 / arm64 的 Electron 并用 lipo 合并，确保生成的 .dmg 在 Intel 与
+  # Apple Silicon 上均可安装使用（配置 mac.target.arch 已设为 universal，此处显式
+  # 兜底，避免默认回退到宿主单机架构）。
+  run "${ELECTRON_BUILDER}" --dir --universal --mac --config electron-builder.config.cjs \
+    || fail "electron-builder 打包中断。常见原因：依赖损坏、Electron 二进制下载失败、磁盘空间不足。详见 ${LOG}。"
 
   APP_PATH="$(locate_app_bundle)"
   [ -n "${APP_PATH}" ] || fail "未能在 ${RELEASE_DIR} 下定位到生成的 .app 包。"
@@ -282,7 +308,7 @@ build_app() {
   log ".app 打包完成并校验通过：${APP_PATH}"
 }
 
-# 在 release 目录下定位 .app（优先 arm64 目录）。
+# 在 release 目录下定位 .app（通用打包产物位于 release/mac，find 自动覆盖）。
 locate_app_bundle() {
   local candidate
   candidate="$(find "$RELEASE_DIR" -maxdepth 2 -name '*.app' -type d 2>/dev/null | head -n1)"
