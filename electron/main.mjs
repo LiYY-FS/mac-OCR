@@ -609,6 +609,46 @@ function refreshPermissionState() {
   hostState.permissions.screenCapture = status === 'not-determined' ? 'unknown' : status;
 }
 
+/**
+ * 在真正发起截图前确保屏幕录制权限可用。
+ * - 已授权（granted）：直接通过。
+ * - 未决定（not-determined / unknown）：主动调用 askForMediaAccess('screen') 唤起系统授权
+ *   弹窗。用户授权后继续；用户拒绝/关闭则按系统实际状态处理（后续 desktopCapturer
+ *   仍会在真正截取时再次唤起授权提示，不会静默失败）。
+ * - 被拒绝（denied）/受限（restricted）：返回 false，由调用方引导用户前往系统设置开启。
+ *
+ * 这是修复「安装后首次点击截图无反应」的关键：新安装的 .app 是全新 bundle 身份，
+ * 系统权限初始为 not-determined；若不主动请求授权，而只是把 not-determined 当作
+ * 无权限拦截，框选 overlay 永远无法出现。未签名/未公证的应用同样会触发该授权流程。
+ * @returns {Promise<boolean>} 是否可继续截图
+ */
+async function ensureScreenCapturePermission() {
+  refreshPermissionState();
+  const status = hostState.permissions.screenCapture;
+
+  if (status === 'granted') {
+    return true;
+  }
+
+  if (status === 'denied' || status === 'restricted') {
+    return false;
+  }
+
+  // status 为 'unknown'（首次运行、尚未决定）。主动弹窗请求授权。
+  try {
+    await systemPreferences.askForMediaAccess('screen');
+  } catch {
+    // 极少数环境下 askForMediaAccess 不可用或抛错，退化为直接继续，
+    // 后续 desktopCapturer.getSources 会再次唤起系统授权提示。
+  }
+
+  // 重新读取授权状态（askForMediaAccess 之后状态已更新）。
+  refreshPermissionState();
+  const after = hostState.permissions.screenCapture;
+  // 授权成功，或用户仍停留在「未决定」（放行让 getSources 在真正截图时再弹一次）。
+  return after === 'granted' || after === 'unknown';
+}
+
 async function loadRenderer(window, surface) {
   const targetUrl = isDevelopment()
     ? `${devServerUrl}?surface=${surface}`
@@ -1408,10 +1448,14 @@ async function startScreenCapture(mode = 'single') {
   try {
 
   hostState.captureErrorMessage = null;
-  refreshPermissionState();
 
-  if (hostState.permissions.screenCapture !== 'granted') {
-    hostState.captureErrorMessage = '当前无法截图：请先在系统设置中为应用开启"屏幕录制"权限。';
+  // 主动确认屏幕录制权限：首次运行会唤起系统授权弹窗，授权后再创建框选 overlay。
+  // 原先仅判断 status !== 'granted' 就拦截，会把全新安装应用的 not-determined 权限
+  // 当成无权限处理，导致点击截图后框选界面永不出现。
+  const permissionOk = await ensureScreenCapturePermission();
+  if (!permissionOk) {
+    hostState.captureErrorMessage =
+      '当前无法截图：屏幕录制权限已被拒绝或受限。请在「系统设置 → 隐私与安全性 → 屏幕录制」中允许本应用，然后重启应用再试。';
     broadcastShellState();
     return { success: false };
   }
@@ -1788,8 +1832,10 @@ async function captureLongSegment() {
   }
 
   refreshPermissionState();
-  if (hostState.permissions.screenCapture !== 'granted') {
-    hostState.captureErrorMessage = '当前无法继续长截图：请先在系统设置中保持"屏幕录制"权限已开启。';
+  // 仅当权限被明确拒绝/受限时中止；'unknown'（首次授权弹窗尚未回写状态）仍放行，
+  // 避免长截图采集中途被误判为无权限而中断。
+  if (hostState.permissions.screenCapture === 'denied' || hostState.permissions.screenCapture === 'restricted') {
+    hostState.captureErrorMessage = '当前无法继续长截图：屏幕录制权限已被拒绝或受限，请在系统设置中重新开启后重试。';
     broadcastShellState();
     return { success: false };
   }

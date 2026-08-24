@@ -659,7 +659,12 @@ const DesktopShellView = () => {
       return null;
     }
 
-    return '当前缺少屏幕录制权限。需要该权限才能读取屏幕内容并进入截图识别。';
+    if (state.permissions.screenCapture === 'denied' || state.permissions.screenCapture === 'restricted') {
+      return '屏幕录制权限已被拒绝或受限。请在「系统设置 → 隐私与安全性 → 屏幕录制」中允许本应用，然后重启应用以启用截图。';
+    }
+
+    // not-determined / unknown：首次使用会在点击截图按钮时请求系统授权
+    return '首次使用截图功能时，系统会请求「屏幕录制」权限，请在弹窗中点击允许以启用框选截图。';
   }, [isDesktopHost, state.permissions.screenCapture]);
 
   async function startCapture() {
