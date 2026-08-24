@@ -305,6 +305,20 @@ build_app() {
   [ -d "${APP_PATH}/Contents/MacOS" ] || fail "生成的应用不完整：缺少 ${APP_PATH}/Contents/MacOS。"
   [ -f "${APP_PATH}/Contents/Info.plist" ] || fail "生成的应用不完整：缺少 ${APP_PATH}/Contents/Info.plist。"
 
+  # Ad-hoc 签名（codesign --sign -，无需任何证书）。
+  # 未设置 CSC_NAME 时 electron-builder 会完全跳过签名；完全未签名的应用在
+  # 现代 macOS 上 TCC「屏幕录制」授权不稳定（授权易失效、重装即重置，
+  # 表现为“已添加权限却一直提示需要权限”）。Ad-hoc 签名让系统可以稳定地
+  # 识别并记住本应用的授权；仅签名不稳定跨版本（分发仍建议 CSC_NAME+公证）。
+  if [ -z "${CSC_NAME:-}" ]; then
+    log "未设置 CSC_NAME：执行 ad-hoc 签名（codesign --sign -）以稳定 TCC 授权…"
+    if run codesign --force --deep --sign - "${APP_PATH}"; then
+      log "ad-hoc 签名完成：$(codesign -dv "${APP_PATH}" 2>&1 | head -n1)"
+    else
+      warn "ad-hoc 签名失败，应用将以未签名状态打包（不影响本机安装，但 TCC 授权可能不稳定）。"
+    fi
+  fi
+
   log ".app 打包完成并校验通过：${APP_PATH}"
 }
 

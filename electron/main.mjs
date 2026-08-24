@@ -1413,6 +1413,45 @@ function withTimeout(promise, ms, label) {
   });
 }
 
+/**
+ * 「权限已开启但需重启生效」的一键重启引导。
+ * macOS TCC 特性：「屏幕录制」授权变更仅对新启动的进程生效。本应用常驻
+ * 菜单栏（托盘），用户手动「重新打开」并不会重建进程——这正是
+ * 「明明已添加权限却一直提示需要权限」的根因。这里在检测到
+ * 「状态已 granted 但当前进程仍采集不到屏幕」时，弹原生对话框提供
+ * 一键自动重启（app.relaunch），让授权立即生效。
+ * 每个进程生命周期只自动弹一次，避免反复打扰。
+ */
+let relaunchOfferedForPermission = false;
+function offerRelaunchForPermission() {
+  if (relaunchOfferedForPermission) {
+    return;
+  }
+  relaunchOfferedForPermission = true;
+
+  dialog
+    .showMessageBox({
+      type: 'info',
+      buttons: ['立即重启', '稍后再说'],
+      defaultId: 0,
+      cancelId: 1,
+      message: '屏幕录制权限已开启，重启应用后生效',
+      detail:
+        'macOS 规定「屏幕录制」权限变更仅对新启动的应用进程生效；本应用常驻菜单栏，'
+        + '直接重新打开窗口并不会重建进程。点击「立即重启」将自动退出并重新启动应用，'
+        + '权限随即生效，截图功能可正常使用。',
+    })
+    .then(({ response }) => {
+      if (response === 0) {
+        app.relaunch();
+        app.exit(0);
+      }
+    })
+    .catch(() => {
+      // 对话框失败（如无可用窗口）时忽略，用户仍可按错误提示手动重启。
+    });
+}
+
 async function startScreenCapture(mode = 'single') {
   // Guard against re-entrant triggers. `activeCaptureSession` is only set
   // *after* the long `await`s below (getSources + did-finish-load wait).
@@ -1480,9 +1519,11 @@ async function startScreenCapture(mode = 'single') {
       hostState.captureErrorMessage =
         '屏幕录制权限已被拒绝或受限。请打开「系统设置 → 隐私与安全性 → 屏幕录制」允许本应用，然后完全退出并重新打开本应用（macOS 权限变更需重启后生效）。';
     } else if (st === 'granted') {
-      // 权限显示已授予却仍失败：多为授权后未重启（TCC 对运行中进程不生效）。
+      // 权限显示已授予却仍失败：授权后未重启（TCC 对运行中进程不生效）。
+      // 主动提供一键自动重启，彻底终结「已添加权限却一直提示需要权限」的循环。
+      offerRelaunchForPermission();
       hostState.captureErrorMessage =
-        `读取屏幕内容失败：${err?.message ?? String(err)}。若刚在系统设置中开启过权限，请完全退出（托盘图标右键退出）并重新打开本应用后再试。`;
+        '「屏幕录制」权限已开启，但对当前正在运行的进程尚未生效。请在弹出的对话框中点击「立即重启」（或从菜单栏托盘图标右键退出后重新打开），权限即生效。';
     } else {
       hostState.captureErrorMessage =
         '未能读取屏幕内容：尚未获得「屏幕录制」权限。请允许系统弹出的授权请求；若未弹出，请到「系统设置 → 隐私与安全性 → 屏幕录制」手动开启权限，然后完全退出并重新打开本应用再试。';
@@ -1493,10 +1534,16 @@ async function startScreenCapture(mode = 'single') {
   }
 
   if (!sources || sources.length === 0) {
-    // 未读到屏幕内容：权限未授予 / 被拒绝 / 受限。读取运行进程内的真实状态给出指引。
+    // 未读到屏幕内容：权限未授予 / 被拒绝 / 受限 / 已授予但未重启生效。
+    // 读取运行进程内的真实状态给出指引。
     refreshPermissionState();
     const st = hostState.permissions.screenCapture;
-    if (st === 'denied' || st === 'restricted') {
+    if (st === 'granted') {
+      // 状态已 granted 却采集不到屏幕：授权后未重启（TCC 对运行中进程不生效）。
+      offerRelaunchForPermission();
+      hostState.captureErrorMessage =
+        '「屏幕录制」权限已开启，但对当前正在运行的进程尚未生效。请在弹出的对话框中点击「立即重启」（或从菜单栏托盘图标右键退出后重新打开），权限即生效。';
+    } else if (st === 'denied' || st === 'restricted') {
       hostState.captureErrorMessage =
         '屏幕录制权限已被拒绝或受限。请打开「系统设置 → 隐私与安全性 → 屏幕录制」允许本应用，然后完全退出并重新打开本应用（macOS 权限变更需重启后生效）。';
     } else {
@@ -1514,9 +1561,18 @@ async function startScreenCapture(mode = 'single') {
   }
 
   hostState.captureDisplays = [];
+  const usedSourceIds = new Set();
   for (const display of displays) {
-    const source = sourceByDisplayId.get(`${display.id}`);
+    // 优先按 display_id 精确匹配。macOS 上 source.display_id 可能为空串或
+    // 与 screen.getAllDisplays 的 id 不一致，此时按剩余未分配的 source 顺序
+    // 回退匹配，保证每个显示器都能拿到屏幕内容（单屏场景必然命中第一个），
+    // 避免「权限已授予、getSources 成功却仍进不了框选」的错配。
+    let source = sourceByDisplayId.get(`${display.id}`);
+    if (!source || usedSourceIds.has(source.id)) {
+      source = sources.find((s) => !usedSourceIds.has(s.id)) ?? null;
+    }
     if (source) {
+      usedSourceIds.add(source.id);
       hostState.captureDisplays.push({
         displayId: `${display.id}`,
         bounds: { ...display.bounds },
