@@ -48,7 +48,7 @@ Mac 桌面端离线 OCR 截图工具。以 Apple Vision 原生框架为识别引
 
 ## 2. 技术栈
 
-项目采用多进程宿主配合现代化前端工具链，整体以 ESM 组织，包管理使用 pnpm，目前平台限定 Mac arm64
+项目采用多进程宿主配合现代化前端工具链，整体以 ESM 组织，包管理使用 pnpm，目前平台限定 Mac
 
 
 | 类别        | 技术                       | 版本 / 说明                                         |
@@ -63,10 +63,6 @@ Mac 桌面端离线 OCR 截图工具。以 Apple Vision 原生框架为识别引
 | 长图拼接    | `stitcher.html` + Canvas   | 隐藏窗口内按像素差拼接与重叠检测                    |
 | 图标        | lucide-react               | 1.17.0                                              |
 | 测试 / 检查 | Vitest / ESLint / Prettier | 2.0.5 / 9.9.0 / 3.3.3                               |
-
-> 平台限制：前应用仅面向 **Mac**。
-
----
 
 ## 3. 系统架构
 
@@ -134,57 +130,3 @@ Mac 桌面端离线 OCR 截图工具。以 Apple Vision 原生框架为识别引
 | ------------------ | ---------------------------------------- |
 | `pnpm desktop:dev` | Electron + Vite 开发模式（并行拉起两者） |
 | `pnpm dist`        | 一键打包（执行`build.sh`，产出 `.dmg`）  |
-
----
-
-## 9. 打包与安装
-
-> 平台说明：OCR 依赖 **Vision** 框架与 `screen recording` 等 Mac 原生能力，目前仅支持 **Mac**。
-
-### 环境准备
-
-
-| 依赖             | 要求                     | 说明                                          |
-| ---------------- | ------------------------ | --------------------------------------------- |
-| Mac              | 11.0+                    | OCR 依赖 Vision；Apple Silicon / Intel 均支持 |
-| Node.js          | 18+（推荐 20 LTS）       | 提供构建工具链                                |
-| pnpm             | 随 npm 安装或独立安装    | 包管理器                                      |
-| electron-builder | `devDependencies`（^26） | 产出`.app`，再经 `hdiutil` 封装 `.dmg`        |
-| Electron         | `43.0.0`                 | 桌面运行时                                    |
-
-### 一键打包
-
-```bash
-pnpm install        # 安装依赖（含 electron 与 electron-builder）
-pnpm dist           # 一键打包：环境检查 → 编译 OCR 二进制 → 前端构建 → 产出 .app → 生成 .dmg
-```
-
-产物位于 `release/mac-OCR-<版本>.dmg`。关键构建配置见 `electron-builder.config.cjs`（`appId=com.idl.ocr`、`productName=mac-OCR`、`electronDist=node_modules/electron/dist`、`asar=true`、`mac.target=["dir"]`）。**签名与公证由环境变量驱动**，未设置时不签名（仅限本机自用）；对外分发请设置以下环境变量后重新构建：
-
-```bash
-export CSC_NAME="Developer ID Application: Your Name (TEAMID)"
-# 方式 A：App Store Connect API Key（推荐）
-export APPLE_API_KEY="/path/to/AuthKey_*.p8"
-export APPLE_API_KEY_ID="KEYID"
-export APPLE_API_ISSUER="Issuer-UUID"
-# 方式 B：Apple ID + 专用密码
-export APPLE_ID="you@example.com"
-export APPLE_APP_SPECIFIC_PASSWORD="xxxx-xxxx-xxxx-xxxx"
-export APPLE_TEAM_ID="10位TeamID"
-
-pnpm dist  # .app 自动以 hardenedRuntime 签名并公证，.dmg 也签名并公证
-```
-
-### 安装
-
-- **开发 / 调试（`.app`）**：`pnpm dist` 解出的 `mac-OCR.app` 拖入「应用程序」；若未签名被 Gatekeeper 拦截，右键「打开」一次或执行 `xattr -cr /Applications/mac-OCR.app`。
-- **分发（`.dmg`）**：设置上述签名证书与公证凭据后构建的 .dmg 在全新 Mac 上可直接双击挂载、拖入「应用程序」正常启动，不会触发「无法验证开发者」警告。
-
-**首次运行**：系统设置 → 隐私与安全性 → 屏幕录制 → 勾选 `mac-OCR` 并重启应用（否则截图为空）；开机自启动与快捷键 / 主题在设置面板配置。
-
-### 系统要求
-
-- Mac 11.0+（OCR 依赖 Vision 框架）
-- Node.js 18+（仅构建期需要）
-- 首次使用需在「系统设置 → 隐私与安全性 → 屏幕录制」授予权限
-- 开发期间请将终端给予上述权限。注：完全离线（不用担心隐私泄漏）
