@@ -1490,9 +1490,21 @@ async function startScreenCapture(mode = 'single') {
   const displayBoundsList = displays.map((d) => ({ ...d.bounds }));
   const overlayWindows = ensureOverlayWindowsForDisplays(displayBoundsList);
 
-  // Cap thumbnail size to avoid slow full-retina captures. The overlay is mostly
-  // darkened, so a 2560-px longest-side thumbnail is enough for selection and OCR.
-  const captureMaxSide = 2560;
+  // 按显示器「物理像素」请求缩略图，保证截图为原生分辨率。
+  // desktopCapturer 的 thumbnail 会被缩放到不超过 thumbnailSize（只缩不放）；
+  // 此前固定 2560px 上限，在 Retina / 4K / 5K 屏上物理像素远超该值（如
+  // 3024×1964、5120×2880），缩略图被降采样，最终保存的截图明显模糊。
+  // 这里按每个显示器 bounds × scaleFactor 计算物理分辨率并取各屏最大值，
+  // 确保每个屏都按原生分辨率采集。下游裁剪的缩放系数按
+  // thumbnailSize / bounds 动态计算，会自动适配，无需改动。
+  // 性能说明：原生分辨率采集比 2560 上限略慢，但仅发生在用户点击截图的
+  // 单次操作中，换来的是原图级清晰度。
+  const nativeMaxWidth = Math.max(
+    ...displays.map((d) => Math.ceil(d.bounds.width * (d.scaleFactor || 1))),
+  );
+  const nativeMaxHeight = Math.max(
+    ...displays.map((d) => Math.ceil(d.bounds.height * (d.scaleFactor || 1))),
+  );
   // loadRenderer was fire-and-forget inside createOverlayWindow() so the
   // overlay windows are already loading in the background.  We resume
   // the capture pipeline immediately while loading proceeds in parallel.
@@ -1506,7 +1518,7 @@ async function startScreenCapture(mode = 'single') {
     sources = await withTimeout(
       desktopCapturer.getSources({
         types: ['screen'],
-        thumbnailSize: { width: captureMaxSide, height: captureMaxSide },
+        thumbnailSize: { width: nativeMaxWidth, height: nativeMaxHeight },
       }),
       20000,
       '读取屏幕内容超时（20 秒）',
@@ -1894,15 +1906,23 @@ async function completeScreenCapture(event, selection) {
 }
 
 // Shared capture path so the FIRST segment and subsequent segments use the
-// exact same resolution (logical 1x) and coordinate handling. This keeps all
-// stitched images dimensionally consistent.
+// exact same resolution (native physical pixels) and coordinate handling.
+// This keeps all stitched images dimensionally consistent.
 async function captureLongSegmentImage(session) {
   const displays = screen.getAllDisplays();
   const targetDisplay = displays.find((d) => `${d.id}` === session.displayId) ?? screen.getPrimaryDisplay();
 
+  // 逻辑点 × scaleFactor = 物理像素。此前仅用逻辑尺寸（display.size）请求缩略图，
+  // Retina 屏上相当于以 1x 分辨率采集（原生的一半），长截图每一段都被降采样而模糊。
+  // 所有分段（含首段）都走本函数，分辨率必然一致，拼接按 naturalWidth 取最小值
+  // 绘制、重叠检测分辨率无关，提升到原生分辨率不影响拼接一致性。
+  const scaleFactor = targetDisplay.scaleFactor || 1;
   const sources = await desktopCapturer.getSources({
     types: ['screen'],
-    thumbnailSize: { width: targetDisplay.size.width, height: targetDisplay.size.height },
+    thumbnailSize: {
+      width: Math.ceil(targetDisplay.size.width * scaleFactor),
+      height: Math.ceil(targetDisplay.size.height * scaleFactor),
+    },
   });
   const source =
     sources.find((item) => item.display_id === session.displayId) ??
